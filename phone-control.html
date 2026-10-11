@@ -4,8 +4,8 @@
 <style>
 *{box-sizing:border-box}body{margin:0;background:#101820;color:#eaf2f8;font-family:system-ui,sans-serif;padding:24px 18px 50px}main{max-width:480px;margin:auto}h1{font-size:26px}p,small{line-height:1.6;color:#b9c9d9}label{display:block;margin:16px 0 6px}input,button{width:100%;padding:14px;border-radius:10px;font:inherit}input{background:#1c2b39;border:1px solid #496078;color:white}button{border:0;background:#2977e8;color:#fff;font-weight:700;margin-top:12px;min-height:48px}button.secondary{background:#34495e}button.stop{background:#a83444}button:disabled{opacity:.5}#state{padding:16px;background:#1c2b39;border-radius:12px;overflow-wrap:anywhere}#tilt{font-size:36px;text-align:center;margin:20px 0 5px}#direction{text-align:center;color:#81d6ff}#warning{color:#ffd08a}code{overflow-wrap:anywhere}
 </style></head><body><main>
-<h1>케이블카 조종</h1>
-<p>아이폰을 <b>세로 화면</b>으로 사용하세요. 화면이 위를 보도록 약간 눕혀 잡고 왼쪽·오른쪽을 낮춰 조종합니다.</p>
+<h1>케이블카 조종</h1><small>세로 조종 · 감도 개선 v2</small>
+<p>아이폰을 <b>세로 화면</b>으로 사용하세요. 화면이 얼굴을 향하도록 세워 잡고, 핸들을 돌리듯 왼쪽·오른쪽으로 기울이세요. 3°부터 움직이고 20~30°에서 최대 속도로 움직입니다.</p>
 <p id="warning"></p><div id="state" role="status">연결 대기</div>
 <label for="cloudUrl">EMQX Connection Address</label><input id="cloudUrl" placeholder="복사한 주소 붙여넣기" autocapitalize="none" spellcheck="false">
 <label for="cloudUser">MQTT Username</label><input id="cloudUser" autocapitalize="none" autocomplete="off" spellcheck="false">
@@ -49,7 +49,23 @@ const portrait = () => {
   const angle = screen.orientation?.angle ?? window.orientation ?? 0;
   return ((angle % 360) + 360) % 360 === 0;
 };
-function corrected() { return Math.max(-90, Math.min(90, (latest.gamma - zero) * (reversed ? -1 : 1))); }
+// 세워 든 휴대폰의 좌우 기울기를 중력의 화면 평면 투영으로 구합니다.
+// gamma만 쓰면 beta가 90° 근처인 세로 자세에서 값이 불안정해집니다.
+function uprightTilt(beta, gamma) {
+  const b = beta * Math.PI / 180, g = gamma * Math.PI / 180;
+  const x = Math.cos(b) * Math.sin(g), y = Math.sin(b);
+  if (Math.hypot(x, y) < 0.25) return null; // 평평하게 눕힌 상태는 기준 방향이 불명확
+  return Math.atan2(x, y) * 180 / Math.PI;
+}
+function corrected() {
+  const delta = ((latest.tilt - zero + 540) % 360) - 180;
+  return Math.max(-90, Math.min(90, delta * (reversed ? -1 : 1)));
+}
+function controlGamma(tilt) {
+  // 기존 노트북 수신기(5° 정지, 30° 최대 속도)와 그대로 호환됩니다.
+  if (Math.abs(tilt) <= 3) return 0;
+  return Math.sign(tilt) * (5 + 25 * Math.min(1, (Math.abs(tilt) - 3) / 17));
+}
 function stopPacket() {
   if (client?.connected && topic) client.publish(topic, JSON.stringify({gamma:0,active:false,t:Date.now()}), {qos:0,retain:false});
 }
@@ -62,12 +78,13 @@ function finish(message) {
 }
 addEventListener('deviceorientation', e => {
   if (!Number.isFinite(e.gamma) || !Number.isFinite(e.beta)) return;
-  latest = {gamma:e.gamma,beta:e.beta,alpha:Number.isFinite(e.alpha)?e.alpha:0,at:performance.now()};
-  $('tilt').textContent = corrected().toFixed(1) + '°';
+  const tilt = uprightTilt(e.beta, e.gamma);
+  latest = {gamma:e.gamma,beta:e.beta,tilt,alpha:Number.isFinite(e.alpha)?e.alpha:0,at:performance.now()};
+  $('tilt').textContent = tilt === null ? '세워주세요' : corrected().toFixed(1) + '°';
 });
 $('calibrate').onclick = () => {
-  if (!latest || performance.now()-latest.at>1000) { status('먼저 센서를 시작하고 아이폰을 조금 움직여 주세요.'); return; }
-  zero = latest.gamma; stopPacket(); $('tilt').textContent = '0.0°';
+  if (!latest || latest.tilt === null || performance.now()-latest.at>1000) { status('먼저 센서를 시작하고 아이폰을 조금 움직여 주세요.'); return; }
+  zero = latest.tilt; stopPacket(); $('tilt').textContent = '0.0°';
   status('수평 기준을 맞췄습니다. 좌우로 기울여 주세요.');
 };
 $('reverse').onclick = () => {
@@ -104,17 +121,18 @@ $('start').onclick = async () => {
     c.on('error', e => status('MQTT 오류: '+e.message));
     timer = setInterval(() => {
       if (!running || !c.connected) return;
-      if (document.hidden || !portrait() || !latest || performance.now()-latest.at>1000) {
+      if (document.hidden || !portrait() || !latest || latest.tilt === null || performance.now()-latest.at>1000) {
         stopPacket(); $('direction').textContent = '정지';
-        status(!portrait() ? '아이폰을 세로 방향으로 돌려주세요.' : '센서 값 대기 · 아이폰을 조금 움직여 주세요.');
+        status(!portrait() ? '아이폰을 세로 방향으로 돌려주세요.' : '아이폰 화면이 얼굴을 향하도록 세워 잡고 조금 움직여 주세요.');
         return;
       }
-      const gamma = corrected();
-      c.publish(topic, JSON.stringify({ax:0,ay:0,az:9.8,alpha:latest.alpha,beta:latest.beta,gamma,active:true,t:Date.now()}),{qos:0,retain:false},err=>{
+      const tilt = corrected();
+      const gamma = controlGamma(tilt);
+      c.publish(topic, JSON.stringify({ax:0,ay:0,az:9.8,alpha:latest.alpha,beta:latest.beta,gamma,tilt,active:true,t:Date.now()}),{qos:0,retain:false},err=>{
         if(err) status('전송 오류: '+err.message);
       });
       $('count').textContent = ++sent;
-      $('direction').textContent = Math.abs(gamma)<=5 ? '수평 · 정지' : gamma<0 ? '왼쪽 · 하강 (-Z)' : '오른쪽 · 상승 (+Z)';
+      $('direction').textContent = Math.abs(tilt)<=3 ? '수평 · 정지' : tilt<0 ? '왼쪽 · 하강 (-Z)' : '오른쪽 · 상승 (+Z)';
       status('연결됨 ✔ (클라우드) · 센서 전송 중');
     },200);
   } catch(e) { if(token===generation) finish(e.message); }
