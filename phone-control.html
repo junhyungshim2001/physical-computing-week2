@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>케이블카 · 아이폰 조종</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#101820;color:#eaf2f8;font-family:system-ui,sans-serif;padding:24px 18px 50px}main{max-width:480px;margin:auto}h1{font-size:26px}p,small{line-height:1.6;color:#b9c9d9}label{display:block;margin:16px 0 6px}input,button{width:100%;padding:14px;border-radius:10px;font:inherit}input{background:#1c2b39;border:1px solid #496078;color:white}button{border:0;background:#2977e8;color:#fff;font-weight:700;margin-top:12px;min-height:48px}button.secondary{background:#34495e}button.stop{background:#a83444}button:disabled{opacity:.5}#state{padding:16px;background:#1c2b39;border-radius:12px;overflow-wrap:anywhere}#tilt{font-size:36px;text-align:center;margin:20px 0 5px}#direction{text-align:center;color:#81d6ff}#warning{color:#ffd08a}code{overflow-wrap:anywhere}
+</style></head><body><main>
+<h1>케이블카 조종</h1>
+<p>아이폰을 <b>세로 화면</b>으로 사용하세요. 화면이 위를 보도록 약간 눕혀 잡고 왼쪽·오른쪽을 낮춰 조종합니다.</p>
+<p id="warning"></p><div id="state" role="status">연결 대기</div>
+<label for="cloudUrl">EMQX Connection Address</label><input id="cloudUrl" placeholder="복사한 주소 붙여넣기" autocapitalize="none" spellcheck="false">
+<label for="cloudUser">MQTT Username</label><input id="cloudUser" autocapitalize="none" autocomplete="off" spellcheck="false">
+<label for="cloudPass">MQTT Password</label><input id="cloudPass" type="password" autocomplete="off">
+<label for="idInput">노트북과 같은 ID</label><input id="idInput" value="1234" maxlength="32" autocapitalize="none" spellcheck="false">
+<small>비밀번호는 파일이나 브라우저 저장소에 저장하지 않습니다.</small>
+<button id="start">센서 허용 · 연결 · 전송 시작</button>
+<button id="stop" class="stop" disabled>전송 정지 · 연결 끊기</button>
+<div id="tilt">—°</div><div id="direction">왼쪽 하강 · 수평 정지 · 오른쪽 상승</div>
+<button id="calibrate" class="secondary">지금 자세를 수평으로 맞추기</button>
+<button id="reverse" class="secondary">좌우 방향 반전: 꺼짐</button>
+<p>전송: <span id="count">0</span>회 · 간격 200ms<br>토픽: <code id="topic">—</code></p>
+<p>노트북에서도 같은 서버·계정·ID로 연결하고 자동 시뮬레이션은 꺼주세요. 양 끝에서는 멈춥니다. 시연 중 Safari를 화면에 열어두세요.</p>
+</main><script src="https://cdn.jsdelivr.net/npm/mqtt@5.15.2/dist/mqtt.min.js"></script>
+<script>
+const $ = id => document.getElementById(id);
+// Connection Address만 붙여넣어도 보안 WebSocket 주소로 변환합니다.
+function brokerURL(value) {
+  const raw = value.trim();
+  if (!raw) throw new Error('EMQX Connection Address를 입력하세요.');
+  const u = new URL(raw.includes('://') ? raw : 'wss://' + raw);
+  if (u.protocol !== 'wss:' || u.username || u.password || u.search || u.hash)
+    throw new Error('wss 주소 또는 EMQX 호스트 이름을 입력하세요.');
+  if (!u.port) u.port = '8084';
+  if (u.pathname === '/') u.pathname = '/mqtt';
+  return u.href;
+}
+function connectionForm() {
+  const url = brokerURL($('cloudUrl').value);
+  const username = $('cloudUser').value.trim(), password = $('cloudPass').value;
+  const id = $('idInput').value.trim();
+  if (!username || !password) throw new Error('MQTT 사용자 이름과 비밀번호를 입력하세요.');
+  if (!/^[A-Za-z0-9_-]{1,32}$/.test(id)) throw new Error('같은 ID를 양쪽에 입력하세요. 영문·숫자·밑줄·하이픈만 사용합니다.');
+  return {url, username, password, id, topic: `khu/pcomp/${id}/sensor`};
+}
+
+let client = null, timer = null, running = false, generation = 0;
+let latest = null, zero = 0, reversed = false, sent = 0, topic = '';
+const status = text => $('state').textContent = text;
+const portrait = () => {
+  const angle = screen.orientation?.angle ?? window.orientation ?? 0;
+  return ((angle % 360) + 360) % 360 === 0;
+};
+function corrected() { return Math.max(-90, Math.min(90, (latest.gamma - zero) * (reversed ? -1 : 1))); }
+function stopPacket() {
+  if (client?.connected && topic) client.publish(topic, JSON.stringify({gamma:0,active:false,t:Date.now()}), {qos:0,retain:false});
+}
+function finish(message) {
+  generation++; running = false; clearInterval(timer); timer = null;
+  stopPacket();
+  if (client) { client.removeAllListeners(); client.end(); client = null; }
+  $('start').disabled = false; $('stop').disabled = true;
+  $('direction').textContent = '정지'; status(message);
+}
+addEventListener('deviceorientation', e => {
+  if (!Number.isFinite(e.gamma) || !Number.isFinite(e.beta)) return;
+  latest = {gamma:e.gamma,beta:e.beta,alpha:Number.isFinite(e.alpha)?e.alpha:0,at:performance.now()};
+  $('tilt').textContent = corrected().toFixed(1) + '°';
+});
+$('calibrate').onclick = () => {
+  if (!latest || performance.now()-latest.at>1000) { status('먼저 센서를 시작하고 아이폰을 조금 움직여 주세요.'); return; }
+  zero = latest.gamma; stopPacket(); $('tilt').textContent = '0.0°';
+  status('수평 기준을 맞췄습니다. 좌우로 기울여 주세요.');
+};
+$('reverse').onclick = () => {
+  reversed = !reversed; stopPacket();
+  $('reverse').textContent = '좌우 방향 반전: ' + (reversed ? '켜짐' : '꺼짐');
+};
+$('stop').onclick = () => finish('전송을 정지했습니다.');
+$('start').onclick = async () => {
+  if (!isSecureContext) { status('HTTPS 주소로 Safari에서 열어주세요. 로컬 파일은 사용하지 마세요.'); return; }
+  let cfg;
+  try { cfg = connectionForm(); if (typeof mqtt === 'undefined') throw new Error('인터넷 연결을 확인한 뒤 새로고침하세요.'); }
+  catch(e) { status(e.message); return; }
+  const token = ++generation;
+  $('start').disabled = true; $('stop').disabled = false;
+  try {
+    if (typeof DeviceOrientationEvent === 'undefined') throw new Error('이 브라우저는 방향 센서를 지원하지 않습니다. Safari로 열어주세요.');
+    // iOS 권한 요청은 반드시 사용자 버튼 클릭 안에서 호출합니다.
+    if (typeof DeviceOrientationEvent.requestPermission === 'function') {
+      const permission = await DeviceOrientationEvent.requestPermission();
+      if (token !== generation) return;
+      if (permission !== 'granted') throw new Error('동작 및 방향 접근이 거부되었습니다. Safari 권한을 확인하고 다시 시작하세요.');
+    }
+    if (token !== generation) return;
+    topic = cfg.topic; $('topic').textContent = topic;
+    running = true; status('센서 허용 완료 · 클라우드 연결 중…');
+    const c = client = mqtt.connect(cfg.url, {
+      username:cfg.username,password:cfg.password,clientId:'phone-'+crypto.randomUUID(),
+      reconnectPeriod:2000,connectTimeout:10000,clean:true,
+      will:{topic,payload:JSON.stringify({active:false,gamma:0}),qos:0,retain:false}
+    });
+    c.on('connect', () => status('연결됨 ✔ (클라우드) · 센서 전송 중'));
+    c.on('reconnect', () => status('클라우드 재연결 중… · 케이블카는 자동 정지합니다.'));
+    c.on('close', () => status('연결 끊김 · 재연결 대기'));
+    c.on('error', e => status('MQTT 오류: '+e.message));
+    timer = setInterval(() => {
+      if (!running || !c.connected) return;
+      if (document.hidden || !portrait() || !latest || performance.now()-latest.at>1000) {
+        stopPacket(); $('direction').textContent = '정지';
+        status(!portrait() ? '아이폰을 세로 방향으로 돌려주세요.' : '센서 값 대기 · 아이폰을 조금 움직여 주세요.');
+        return;
+      }
+      const gamma = corrected();
+      c.publish(topic, JSON.stringify({ax:0,ay:0,az:9.8,alpha:latest.alpha,beta:latest.beta,gamma,active:true,t:Date.now()}),{qos:0,retain:false},err=>{
+        if(err) status('전송 오류: '+err.message);
+      });
+      $('count').textContent = ++sent;
+      $('direction').textContent = Math.abs(gamma)<=5 ? '수평 · 정지' : gamma<0 ? '왼쪽 · 하강 (-Z)' : '오른쪽 · 상승 (+Z)';
+      status('연결됨 ✔ (클라우드) · 센서 전송 중');
+    },200);
+  } catch(e) { if(token===generation) finish(e.message); }
+};
+document.addEventListener('visibilitychange', () => { if(document.hidden && running) finish('화면을 벗어나 전송을 멈췄습니다. 시작 버튼을 다시 눌러주세요.'); });
+addEventListener('pagehide', () => { if(running) finish('전송 정지'); });
+if(!isSecureContext || location.protocol!=='https:') $('warning').textContent='아이폰에서는 이 파일을 HTTPS 사이트에 올린 뒤 Safari로 열어주세요.';
+</script></body></html>
